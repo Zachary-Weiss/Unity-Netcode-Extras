@@ -393,7 +393,6 @@ public class PlayerClientPrediction : NetworkBehaviour
     /// <returns></returns>
     private bool CompareStatePayloads(StatePayload localState, StatePayload other)
     {
-        
 
         //If they equal each other, return true
         if (localState.Equals(other))
