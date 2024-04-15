@@ -6,6 +6,7 @@ using System.Linq;
 
 public class ServerController : NetworkBehaviour
 {
+    //This is a test
 
     /// <summary>
     /// Store the connected players
