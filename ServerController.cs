@@ -6,12 +6,15 @@ using System.Linq;
 
 public class ServerController : NetworkBehaviour
 {
-    //This is a test
+    /// <summary>
+    /// Stores all connected players and references to their NetworkObject components.
+    /// </summary>
+    private Dictionary<ulong, NetworkObject> playerObjDict;
 
     /// <summary>
-    /// Store the connected players
+    /// Reference to this object's instance of PlayerClientPrediction
     /// </summary>
-    private Dictionary<ulong, NetworkObject> playerIDDict;
+    private PlayerClientPrediction playerClientPrediction;
 
     /// <summary>
     /// Store the index of the last processed input payload from each client
@@ -26,7 +29,7 @@ public class ServerController : NetworkBehaviour
     /// <summary>
     /// Stores all of the states processed by the server, to be sent back to the players at the end of every tick
     /// </summary>
-    private Queue<StatePayload> playerStateQueue;
+    private List<StatePayload> playerStateList;
 
     /// <summary>
     /// List of all of the players that had input processed this tick
@@ -53,34 +56,40 @@ public class ServerController : NetworkBehaviour
     private void Awake()
     {
         //Instantiate data structures
-        playerIDDict = new Dictionary<ulong, NetworkObject>();
+        playerObjDict = new Dictionary<ulong, NetworkObject>();
         lastProcessedIndexes = new Dictionary<ulong, int>();
         playerInputQueue = new Queue<InputPayload>();
-        playerStateQueue = new Queue<StatePayload>();
+        playerStateList = new List<StatePayload>();
         playersActiveThisTick = new List<ulong>();
-    }
-
-    private void Start()
-    {
-        //DeactivateIfNotHost();
-        //playerIDDict.Add(this.OwnerClientId, this.GetComponent<NetworkObject>());
-        //playersActiveThisTick.Add(this.OwnerClientId);
     }
 
     public override void OnNetworkSpawn()
     {
-        NetworkManager.NetworkTickSystem.Tick += Tick;
+        
+        //deactivate this script for non-host players
         DeactivateIfNotHost();
         if (!isActivated) { return; }
 
-        playerIDDict.Add(this.OwnerClientId, this.GetComponent<NetworkObject>());
+        //subscribe to tick
+        NetworkManager.NetworkTickSystem.Tick += Tick;
+
+        playerObjDict.Add(this.OwnerClientId, this.GetComponent<NetworkObject>());
         playersActiveThisTick.Add(this.OwnerClientId);
+
+        //reference other scripts
+        playerClientPrediction = this.GetComponent<PlayerClientPrediction>();
     }
 
     private void Tick()
     {
+        //this might not actually need to be here because I also run this before this instance subscribes to 
+        // NetworkTickSystem.Tick, so theoretically, non-host clients and objects shouldn't be subscribed.
         if (!isActivated) { return; }
+        Debug.Log("Starting Tick");
+
         ProcessAndSendInputs();
+
+        Debug.Log("Tick is finished");
     }
 
     public override void OnNetworkDespawn() // don't forget to unsubscribe
@@ -94,6 +103,33 @@ public class ServerController : NetworkBehaviour
     /// </summary>
     private void ProcessAndSendInputs()
     {
+        //Save the "local" state of each other player. After applying the input to the other player objects
+        // and recording and sending those states, we will return their objects to this state, to preserve
+        // visual continuity for the host.
+        StatePayload[] otherPlayerStates = new StatePayload[playerObjDict.Count - 1];
+        int c = 0;
+        foreach (KeyValuePair<ulong, NetworkObject> kv in playerObjDict)
+        {
+            Debug.Log("Should I save a state for player " + kv.Key + "?");
+            if (kv.Key != this.OwnerClientId)
+            {
+                Debug.Log("Saving state for player " + kv.Key);
+                otherPlayerStates[c] = new StatePayload(kv.Value);
+                c++;
+            }
+            else { Debug.Log("Not saving state for player " + kv.Key + ", " + kv.Key + " == " + this.OwnerClientId); }
+        }
+
+        //The host has been interpolating the other players to make their actions look smooth, but 
+        // they need to be snapped to their most recent state before we process their input so their new
+        // state is accurate.
+        SnapOtherPlayers();
+
+
+
+
+
+
 
         //process every input in the queue
         for (int i = 0; i < playerInputQueue.Count; i++)
@@ -122,9 +158,9 @@ public class ServerController : NetworkBehaviour
         //players less specific information on the other clients? ex. does player 2 need to know that player 1 has an ability primed?)
 
         //I only need to send each player their most recent state. 
-        for (int i = 0; i < playerStateQueue.Count; i++)
+        for (int i = 0; i < playerStateList.Count; i++)
         {
-            StatePayload sp = playerStateQueue.Dequeue();
+            StatePayload sp = playerStateList[i];
             
             //Don't need to send the host an rpc for itself
             if (sp.clientID != this.OwnerClientId)
@@ -132,6 +168,14 @@ public class ServerController : NetworkBehaviour
                 SendSingleClientState(sp);
             }
             SendOtherClientsState(sp);
+        }
+
+
+        //Apply all of the previously stored states to their respective player objects
+        foreach (StatePayload state in otherPlayerStates)
+        {
+            Debug.Log("Applying state of player " + state.clientID);
+            PlayerClientPrediction.ApplyState(playerObjDict[state.clientID], state);
         }
 
     }
@@ -151,7 +195,7 @@ public class ServerController : NetworkBehaviour
         if (input.clientID != OwnerClientId)
         {
             //Get a reference to the current player's NetworkObject
-            playerObjectReference = playerIDDict[input.clientID];
+            playerObjectReference = playerObjDict[input.clientID];
 
             //Process player movement
             playerObjectReference.GetComponent<PlayerClientPrediction>().ApplyInput(input);
@@ -192,7 +236,7 @@ public class ServerController : NetworkBehaviour
         if (id != 0)
         {
             //Debug.Log(lastProcessedIndexes[id]);
-            playerStateQueue.Enqueue(new StatePayload
+            playerStateList.Add(new StatePayload
             {
                 playerBodyRotation = NetworkManager.Singleton.ConnectedClients[id].PlayerObject.transform.rotation,
                 playerCameraRotation = NetworkManager.Singleton.ConnectedClients[id].PlayerObject.GetComponentInChildren<Camera>().transform.rotation,
@@ -205,7 +249,7 @@ public class ServerController : NetworkBehaviour
         //Don't need a state index for the host, because they won't perform reconciliation.
         else
         {
-            playerStateQueue.Enqueue(new StatePayload
+            playerStateList.Add(new StatePayload
             {
                 playerBodyRotation = NetworkManager.Singleton.ConnectedClients[id].PlayerObject.transform.rotation,
                 playerCameraRotation = NetworkManager.Singleton.ConnectedClients[id].PlayerObject.GetComponentInChildren<Camera>().transform.rotation,
@@ -227,17 +271,23 @@ public class ServerController : NetworkBehaviour
     private void SendOtherClientsState(StatePayload state)
     {
         //Create a playerInfoPayload
-        PlayerInfoPayload otherPlayerInfoReference = new PlayerInfoPayload(state, playerIDDict[state.clientID]);
+        PlayerInfoPayload otherPlayerInfoReference = new PlayerInfoPayload(state, playerObjDict[state.clientID]);
 
         //Iterate through all players that aren't the one in the state or the host and send them playerInfo
-        foreach (ulong id in playerIDDict.Keys)
+        foreach (ulong id in playerObjDict.Keys)
         {
             //Send the state if it isn't being sent to the host and a player isn't being sent their own state
             if (id != this.OwnerClientId && id != state.clientID)
             {
-                SendOtherClientStateRpc(otherPlayerInfoReference, playerIDDict[id], RpcTarget.Single(id, RpcTargetUse.Temp));
+                SendOtherClientStateRpc(otherPlayerInfoReference, playerObjDict[id], RpcTarget.Single(id, RpcTargetUse.Temp));
             }
-            //else { Debug.Log("Not synching state, " + id + " == " + this.OwnerClientId + " and/or " + id + " == " + state.clientID); }
+
+            //"Send" the state to the local instance of PlayerClientPrediction, so it can interpolate the other 
+            // players too.
+            else if (id == this.OwnerClientId && id != state.clientID)
+            {
+                playerClientPrediction.ProcessOtherPlayerStates(otherPlayerInfoReference);
+            }
         }
     }
 
@@ -265,9 +315,9 @@ public class ServerController : NetworkBehaviour
     private void PrivateStoreInput(InputPayload input)
     {
         //If input hasn't been recieved from this player before, add them to the dict so we have a reference to their player object
-        if (!playerIDDict.ContainsKey(input.clientID))
+        if (!playerObjDict.ContainsKey(input.clientID))
         {
-            playerIDDict.Add(input.clientID, NetworkManager.Singleton.ConnectedClients[input.clientID].PlayerObject);
+            playerObjDict.Add(input.clientID, NetworkManager.Singleton.ConnectedClients[input.clientID].PlayerObject);
         }
 
         //Store the input in the queue.
@@ -281,7 +331,7 @@ public class ServerController : NetworkBehaviour
     private void SendSingleClientState(StatePayload state)
     {
         //Send the rpc to the client id specified in the StatePayload with a reference to the NetworkObject
-        SendSingleClientStateRpc(state, playerIDDict[state.clientID], RpcTarget.Single(state.clientID, RpcTargetUse.Temp));
+        SendSingleClientStateRpc(state, playerObjDict[state.clientID], RpcTarget.Single(state.clientID, RpcTargetUse.Temp));
 
 
         //RpcTargetUse.Temp means that there is one instance of RpcTargetUse that is repopulated every time I call an RpcTarget method,
@@ -301,6 +351,23 @@ public class ServerController : NetworkBehaviour
         }
     }
 
+    /// <summary>
+    /// Set all clients to their most recently processed state. This is done so that their new input isn't
+    /// processed based on partially-interpolated data.
+    /// </summary>
+    private void SnapOtherPlayers()
+    {
+        foreach (StatePayload sp in playerStateList)
+        {
+            //Don't need to set the state of this object; it doesn't interpolate itself!
+            if (sp.clientID != this.OwnerClientId)
+            {
+                Debug.Log("Snapping player " +  sp.clientID);
+                PlayerClientPrediction.ApplyState(playerObjDict[sp.clientID], sp);
+            }
+        }
+        playerStateList.Clear();
+    }
 
     /// <summary>
     /// Checks if the player is the host, and if not, then this script is disabled.

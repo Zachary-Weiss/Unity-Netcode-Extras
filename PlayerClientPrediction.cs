@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using UnityEngine;
 using Unity.Netcode;
 using UnityEngine.UIElements;
+using System;
+using UnityEngine.Windows;
 
 
 //Structs
@@ -57,6 +59,21 @@ public struct StatePayload : INetworkSerializable
     public Vector3 playerPosition;
     public int state_Index;
     public ulong clientID;
+
+    /// <summary>
+    /// Fills all of the fields of StatePayload except state_Index, which is given a value of -1.
+    /// </summary>
+    /// <param name="obj"></param>
+    public StatePayload(NetworkObject obj)
+    {
+        playerBodyRotation = obj.transform.rotation;
+        playerCameraRotation = obj.GetComponentInChildren<Camera>().transform.rotation;
+        playerPosition = obj.transform.position;
+        clientID = obj.OwnerClientId;
+
+        //Remember that this field isn't filled
+        state_Index = -1;
+    }
 
     public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
     {
@@ -128,7 +145,7 @@ public class PlayerClientPrediction : NetworkBehaviour
     /// <summary>
     /// Counts the time it's been since the last bit of info was recieved from the server's last tick.
     /// </summary>
-    private float interpolationTime = 0;
+    public float interpolationTime = 0;
 
 
     //Component References
@@ -144,7 +161,6 @@ public class PlayerClientPrediction : NetworkBehaviour
     //this reference comes from an RPC
     private NetworkObject serverPlayer;
 
-    
 
     private void Awake()
     {
@@ -212,13 +228,13 @@ public class PlayerClientPrediction : NetworkBehaviour
             InterpolateOtherPlayers(input.clientDeltaTime);
         }
 
-        //otherwise, just move the host
+        //otherwise, just move the host and interpolate the other players
         else
         {
             ApplyInput(input);
+
+            InterpolateOtherPlayers(input.clientDeltaTime);
         }
-
-
 
     }
 
@@ -298,7 +314,7 @@ public class PlayerClientPrediction : NetworkBehaviour
     }
 
     /// <summary>
-    /// Predict game state locally.
+    /// Apply an InputPayload to a player object.
     /// </summary>
     /// <param name="input"></param>
     public void ApplyInput(InputPayload input)
@@ -309,6 +325,19 @@ public class PlayerClientPrediction : NetworkBehaviour
         //Player camera movement
         mouseLook.LookUpdate(input.mouseLookInput, input.clientDeltaTime);
     }
+
+    /*
+    /// <summary>
+    /// Same as ApplyInput, but instead of actually applying the input to the object, it's returned as
+    /// a StatePayload.
+    /// </summary>
+    /// <param name="input">The InputPayload to "apply."</param>
+    /// <param name="obj">The player object to "apply" the InputPayload to.</param>
+    /// <returns>The state of the player object, if the InputPayload were actually applied to it.</returns>
+    public static StatePayload ConvertInput(InputPayload input, NetworkObject obj)
+    {
+        
+    }*/
 
     /// <summary>
     /// Fetch the server NetworkObject reference
@@ -344,7 +373,7 @@ public class PlayerClientPrediction : NetworkBehaviour
     {
         //process input (copy pasted functions from other scripts?)
         serverPlayer.GetComponent<ServerController>().StoreInput(inputPayload);
-        serverPlayer.GetComponent<PlayerClientPrediction>().AddStateToPlayerDict(state);
+        //serverPlayer.GetComponent<PlayerClientPrediction>().AddStateToPlayerDict(state);
     }
 
     /// <summary>
@@ -356,13 +385,6 @@ public class PlayerClientPrediction : NetworkBehaviour
         //If I can reference the player I'm going to move
         if (info.networkObject.TryGet(out NetworkObject otherPlayer))
         {
-            /*
-            //update all their stuff here
-            otherPlayer.transform.position = info.playerPosition;
-
-            otherPlayer.transform.rotation = info.playerBodyRotation;
-            otherPlayer.GetComponentInChildren<Camera>().transform.rotation = info.playerCameraRotation;*/
-
             AddStateToPlayerDict(info);
         }
     }
@@ -393,8 +415,6 @@ public class PlayerClientPrediction : NetworkBehaviour
     /// <returns></returns>
     private bool CompareStatePayloads(StatePayload localState, StatePayload other)
     {
-
-        //If they equal each other, return true
         if (localState.Equals(other))
         {
             return true;
@@ -407,19 +427,14 @@ public class PlayerClientPrediction : NetworkBehaviour
                 Debug.Log("PlayerPos mismatch: " + localState.playerPosition + "!=" + other.playerPosition);
             }
 
-            if (localState.playerBodyRotation != other.playerBodyRotation)
+            if (!localState.playerBodyRotation.Equals(other.playerBodyRotation))
             {
                 Debug.Log("PlayerBodyRotation mismatch: " + localState.playerPosition + "!=" + other.playerPosition);
             }
 
-            if (localState.playerCameraRotation != other.playerCameraRotation)
+            if (!localState.playerCameraRotation.Equals(other.playerCameraRotation))
             {
                 Debug.Log("PlayerCameraRotation mismatch: " + localState.playerPosition + "!=" + other.playerPosition);
-            }
-
-            if (localState.playerPosition != other.playerPosition)
-            {
-                Debug.Log("PlayerPos mismatch: " + localState.playerPosition + "!=" + other.playerPosition);
             }
 
             return false;
@@ -453,13 +468,23 @@ public class PlayerClientPrediction : NetworkBehaviour
     /// <param name="index">Index of the state (in pastGameStates) to apply. </param>
     private void ApplyPastState(int index)
     {
-        //apply inputs
-        transform.position = pastGameStates[index].playerPosition;
-        transform.rotation = pastGameStates[index].playerBodyRotation;
-        cam.rotation = pastGameStates[index].playerCameraRotation;
+        //apply state
+        PlayerClientPrediction.ApplyState(this.GetComponent<NetworkObject>(), pastGameStates[index]);
 
         //change the past...
         pastGameStates[index] = CreateLocalState();
+    }
+
+    /// <summary>
+    /// Sets a player object to a state.
+    /// </summary>
+    /// <param name="obj">The target player object.</param>
+    /// <param name="state">The state to apply to the object.</param>
+    public static void ApplyState(NetworkObject obj, StatePayload state)
+    {
+        obj.transform.position = state.playerPosition;
+        obj.transform.rotation = state.playerBodyRotation;
+        obj.GetComponentInChildren<Camera>().transform.rotation = state.playerCameraRotation;
     }
 
     /// <summary>
@@ -469,28 +494,28 @@ public class PlayerClientPrediction : NetworkBehaviour
     /// <param name="other"></param>
     public void AddStateToPlayerDict(PlayerInfoPayload state)
     {
-        Debug.Log("AddStateToPlayerDict for player " + state.clientID);
         //create an entry for the player if one doesn't exist
         if (!otherPlayerStates.ContainsKey(state.clientID))
         {
-            Debug.Log("creating new state for player " + state.clientID);
             //create the array to be the value for the dict and set the most recent state to the one being processed.
             //this is so that when the rest of the function runs, both stateArray[0] and stateArray[1] will be the same
             //value, so I can interpolate between them without a nullReferenceException.
             PlayerInfoPayload[] stateArray = new PlayerInfoPayload[2];
-            stateArray[1] = state;
-
+            stateArray[0] = state;
+            
             otherPlayerStates.Add(state.clientID, stateArray);
         }
 
         //shift back the older state, and add the new one
         if (otherPlayerStates.TryGetValue(state.clientID, out PlayerInfoPayload[] array))
         {
-            Debug.Log("array[0] = " + array[1].playerPosition + ", array[1] = " + state.playerPosition);
-            array[0] = array[1];
-            array[1] = state;
+            array[1] = array[0];
+            array[0] = state;
         }
+
+
         //reset interpolationTime
+        Debug.Log("Resetting interpolationTime");
         interpolationTime = 0;
     }
 
@@ -500,19 +525,22 @@ public class PlayerClientPrediction : NetworkBehaviour
     /// </summary>
     private void InterpolateOtherPlayers(float deltaTime)
     {
+        interpolationTime += deltaTime;
+        //Debug.Log("Interpolation time = " + interpolationTime);
+        Debug.Log("Starting interpolation process");
         foreach (ulong id in otherPlayerStates.Keys)
         {
-            Debug.Log("interpolating player " + id);
             if (otherPlayerStates.TryGetValue(id, out PlayerInfoPayload[] states))
             {
                 //reference their NetworkObject. Should I also have a Dictionary<ulong, NetworkObject>? probably.
-                if (states[1].networkObject.TryGet(out NetworkObject otherPlayer))
+                if (states[0].networkObject.TryGet(out NetworkObject otherPlayer))
                 {
+                    Debug.Log("Interpolating: t = " + (float) interpolationTime / (1f / 25f));
                     //interpolate movement
-                    otherPlayer.transform.position = Vector3.Lerp(states[0].playerPosition, states[1].playerPosition, interpolationTime / (1f / 25f));
-                    otherPlayer.transform.rotation = Quaternion.Lerp(states[0].playerBodyRotation, states[1].playerBodyRotation, interpolationTime / (1 / 25));
+                    otherPlayer.transform.position = Vector3.Lerp(states[1].playerPosition, states[0].playerPosition, interpolationTime / (1f / 25f));
+                    otherPlayer.transform.rotation = Quaternion.Lerp(states[1].playerBodyRotation, states[0].playerBodyRotation, interpolationTime / (1 / 25));
                     otherPlayer.GetComponentInChildren<Camera>().transform.rotation = Quaternion.Lerp(
-                        states[0].playerCameraRotation, states[1].playerCameraRotation, interpolationTime / (1f / 25f));
+                        states[1].playerCameraRotation, states[0].playerCameraRotation, interpolationTime / (1f / 25f));
 
                     //interpolate other stuff here
                     
@@ -523,8 +551,9 @@ public class PlayerClientPrediction : NetworkBehaviour
                 }
             }
         }
-        interpolationTime += deltaTime;
+        
     }
+
 
     //prevents memory leaks, supposedly
     private void OnEnable()
